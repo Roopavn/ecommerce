@@ -29,7 +29,15 @@ jobs:
           pip install -r requirements.txt
 
       - name: Django system checks
+        env:
+          DJANGO_SECRET_KEY: ci-test-secret
+          DJANGO_DEBUG: "True"
+          DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
         run: python manage.py check
 
       - name: Run tests
+        env:
+          DJANGO_SECRET_KEY: ci-test-secret
+          DJANGO_DEBUG: "True"
+          DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
         run: python manage.py test

@@ -1,16 +1,19 @@
 import json
 import os
 import uuid
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import razorpay
-from django.db import transaction
+from django.db import IntegrityError, transaction
+from django.core.validators import validate_email
+from django.core.exceptions import ValidationError
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
-from .models import Customer, Order, OrderItem, Product, ShippingAddress
+from .emails import send_payment_notification
+from .models import Customer, Order, OrderItem, Product, RazorpayWebhookEvent, ShippingAddress
 
 
 def get_cart(request):
@@ -27,7 +30,10 @@ def get_cart_data(request):
     products = Product.objects.filter(id__in=product_ids)
     items, cart_items, cart_total = [], 0, Decimal("0.00")
     for product in products:
-        quantity = max(int(cart.get(str(product.id), {}).get("quantity", 0)), 0)
+        try:
+            quantity = max(int(cart.get(str(product.id), {}).get("quantity", 0)), 0)
+        except (TypeError, ValueError):
+            quantity = 0
         if quantity:
             total = product.price * quantity
             items.append({"product": product, "quantity": quantity, "total": total})
@@ -60,14 +66,48 @@ def checkout(request):
     return render(request, "checkout.html", data)
 
 
+def get_or_create_customer(request, name, email):
+    customer = Customer.objects.filter(user=request.user).first() if request.user.is_authenticated else Customer.objects.filter(user__isnull=True, email__iexact=email).first()
+    if not customer:
+        customer = Customer.objects.create(
+            user=request.user if request.user.is_authenticated else None,
+            name=name,
+            email=email,
+        )
+    else:
+        customer.name = name
+        customer.email = email
+        customer.save(update_fields=["name", "email"])
+    return customer
+
+
 @require_POST
 def create_payment_order(request):
     data = get_cart_data(request)
     if not data["items"]:
         return JsonResponse({"error": "Your cart is empty."}, status=400)
 
-    amount_paise = int(data["cart_total"] * 100)
-    order = Order.objects.create()
+    try:
+        request_data = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON payload."}, status=400)
+
+    name = (request_data.get("name") or "").strip()
+    email = (request_data.get("email") or "").strip()
+    if not name or not email:
+        return JsonResponse({"error": "Name and email are required."}, status=400)
+    try:
+        validate_email(email)
+    except ValidationError:
+        return JsonResponse({"error": "Enter a valid email address."}, status=400)
+
+    customer = get_or_create_customer(request, name, email)
+
+    amount_paise = int((data["cart_total"] * 100).quantize(Decimal("1")))
+    order = Order.objects.create(customer=customer, payment_amount=data["cart_total"], payment_currency="INR")
+    for item in data["items"]:
+        OrderItem.objects.create(order=order, product=item["product"], quantity=item["quantity"])
+
     rp_order = razorpay_client().order.create({
         "amount": amount_paise,
         "currency": "INR",
@@ -103,16 +143,25 @@ def verify_payment(request):
         return JsonResponse({"error": "Order not found."}, status=404)
 
     try:
-        razorpay_client().utility.verify_payment_signature(params)
+        client = razorpay_client()
+        client.utility.verify_payment_signature(params)
+        payment = client.payment.fetch(params["razorpay_payment_id"])
     except razorpay.errors.SignatureVerificationError:
-        order.payment_status = Order.PAYMENT_FAILED
-        order.save(update_fields=["payment_status"])
-        return JsonResponse({"error": "Payment signature verification failed."}, status=400)
+        return JsonResponse({"error": "Payment verification failed."}, status=400)
+    except Exception:
+        return JsonResponse({"error": "Unable to verify payment with Razorpay."}, status=502)
+
+    expected_amount = int((order.payment_amount * 100).quantize(Decimal("1")))
+    if payment.get("order_id") != order.payment_order_id or int(payment.get("amount", -1)) != expected_amount or payment.get("currency") != order.payment_currency:
+        return JsonResponse({"error": "Payment amount or order mismatch."}, status=400)
+    if payment.get("status") not in {"captured"}:
+        return JsonResponse({"error": "Payment has not been captured."}, status=400)
 
     order.payment_id = params["razorpay_payment_id"]
     order.payment_status = Order.PAYMENT_PAID
     order.complete = True
     order.save(update_fields=["payment_id", "payment_status", "complete"])
+    send_payment_notification(order, Order.PAYMENT_PAID)
     return JsonResponse({"success": True, "order_id": order.id})
 
 
@@ -121,26 +170,56 @@ def verify_payment(request):
 def razorpay_webhook(request):
     secret = os.environ.get("RAZORPAY_WEBHOOK_SECRET")
     signature = request.headers.get("X-Razorpay-Signature")
-    if not secret or not signature:
+    event_id = request.headers.get("x-razorpay-event-id")
+    if not secret or not signature or not event_id:
         return JsonResponse({"error": "Webhook configuration/signature missing."}, status=400)
+
     try:
-        razorpay_client().utility.verify_webhook_signature(request.body, signature, secret)
+        client = razorpay_client()
+        client.utility.verify_webhook_signature(request.body, signature, secret)
         payload = json.loads(request.body)
     except (razorpay.errors.SignatureVerificationError, json.JSONDecodeError):
         return JsonResponse({"error": "Invalid webhook."}, status=400)
+    except Exception:
+        return JsonResponse({"error": "Webhook processing failed."}, status=500)
 
-    event = payload.get("event")
+    event = payload.get("event", "")
     payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
     rp_order_id = payment.get("order_id")
     order = Order.objects.filter(payment_order_id=rp_order_id).first()
-    if order:
-        if event in {"payment.captured", "order.paid"}:
-            order.payment_id = payment.get("id") or order.payment_id
-            order.payment_status = Order.PAYMENT_PAID
-            order.complete = True
-        elif event == "payment.failed":
-            order.payment_status = Order.PAYMENT_FAILED
-        order.save(update_fields=["payment_id", "payment_status", "complete"])
+
+    try:
+        with transaction.atomic():
+            RazorpayWebhookEvent.objects.create(event_id=event_id, event=event)
+            if not order:
+                return JsonResponse({"received": True})
+
+            expected_amount = int((order.payment_amount * 100).quantize(Decimal("1")))
+            webhook_amount = payment.get("amount")
+            webhook_currency = payment.get("currency")
+            if webhook_amount is not None and (int(webhook_amount) != expected_amount or webhook_currency != order.payment_currency):
+                return JsonResponse({"error": "Webhook payment amount mismatch."}, status=400)
+
+            if event in {"payment.captured", "order.paid"}:
+                order.payment_id = payment.get("id") or order.payment_id
+                order.payment_status = Order.PAYMENT_PAID
+                order.complete = True
+                order.save(update_fields=["payment_id", "payment_status", "complete"])
+                notification_status = Order.PAYMENT_PAID
+            elif event == "payment.failed" and order.payment_status != Order.PAYMENT_PAID:
+                order.payment_id = payment.get("id") or order.payment_id
+                order.payment_status = Order.PAYMENT_FAILED
+                order.complete = False
+                order.save(update_fields=["payment_id", "payment_status", "complete"])
+                notification_status = Order.PAYMENT_FAILED
+            else:
+                notification_status = None
+
+        if notification_status and not send_payment_notification(order, notification_status):
+            return JsonResponse({"error": "Payment updated but notification delivery failed."}, status=500)
+    except IntegrityError:
+        return JsonResponse({"received": True})
+
     return JsonResponse({"received": True})
 
 
@@ -151,11 +230,7 @@ def process_order(request):
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON payload."}, status=400)
 
-    data = get_cart_data(request)
     payment_id, rp_order_id = payload.get("razorpay_payment_id"), payload.get("razorpay_order_id")
-    if not data["items"]:
-        return JsonResponse({"error": "Your cart is empty."}, status=400)
-
     order = Order.objects.filter(payment_order_id=rp_order_id, payment_id=payment_id, payment_status=Order.PAYMENT_PAID).first()
     if not order:
         return JsonResponse({"error": "Payment is not verified."}, status=400)
@@ -165,19 +240,16 @@ def process_order(request):
     if not name or not email:
         return JsonResponse({"error": "Name and email are required."}, status=400)
 
-    customer = Customer.objects.filter(user=request.user).first() if request.user.is_authenticated else Customer.objects.filter(user__isnull=True, email=email).first()
-    if not customer:
-        customer = Customer.objects.create(
-            user=request.user if request.user.is_authenticated else None,
-            name=name,
-            email=email,
-        )
+    try:
+        validate_email(email)
+    except ValidationError:
+        return JsonResponse({"error": "Enter a valid email address."}, status=400)
+
+    customer = get_or_create_customer(request, name, email)
 
     with transaction.atomic():
         order.customer = customer
-        for item in data["items"]:
-            OrderItem.objects.get_or_create(order=order, product=item["product"], defaults={"quantity": item["quantity"]})
-        if any(not item["product"].digital for item in data["items"]):
+        if order.shipping:
             required = ("address", "city", "state", "zipcode")
             if any(not str(shipping.get(field, "")).strip() for field in required):
                 return JsonResponse({"error": "Complete shipping information is required."}, status=400)

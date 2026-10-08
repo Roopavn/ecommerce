@@ -25,7 +25,7 @@ document.getElementById("form").addEventListener("submit", async function(e) {
  const form=e.target, button=document.getElementById("pay-button");
  button.disabled=true;
  try {
-  const create=await fetch("{% url 'create_payment_order' %}",{method:"POST",headers:{"X-CSRFToken":getCookie("csrftoken")}});
+  const create=await fetch("{% url 'create_payment_order' %}",{method:"POST",headers:{"Content-Type":"application/json","X-CSRFToken":getCookie("csrftoken")},body:JSON.stringify({name:form.name.value.trim(),email:form.email.value.trim()})});
   const payment=await create.json();
   if(!create.ok) throw new Error(payment.error||"Unable to create payment.");
   const options={
