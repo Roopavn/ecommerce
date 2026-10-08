@@ -4,6 +4,7 @@
     <div class="col-lg-6">
         <div class="box-element" id="form-wrapper">
             <form id="form">
+                {% csrf_token %}
                 <div class="form-field">
                     <input required class="form-control" type="text" name="name" placeholder="Name">
                 </div>
@@ -48,14 +49,6 @@ document.getElementById("form").addEventListener("submit", async function(event)
     event.preventDefault();
 
     const form = event.target;
-    const shipping = {
-        address: form.address.value.trim(),
-        city: form.city.value.trim(),
-        state: form.state.value.trim(),
-        zipcode: form.zipcode.value.trim(),
-        country: form.country.value.trim()
-    };
-
     const response = await fetch("{% url 'process_order' %}", {
         method: "POST",
         headers: {
@@ -64,7 +57,13 @@ document.getElementById("form").addEventListener("submit", async function(event)
         },
         body: JSON.stringify({
             form: {name: form.name.value.trim(), email: form.email.value.trim()},
-            shipping: shipping
+            shipping: {
+                address: form.address.value.trim(),
+                city: form.city.value.trim(),
+                state: form.state.value.trim(),
+                zipcode: form.zipcode.value.trim(),
+                country: form.country.value.trim()
+            }
         })
     });
 
