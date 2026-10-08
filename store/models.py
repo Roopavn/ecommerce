@@ -29,6 +29,8 @@ class Order(models.Model):
     payment_order_id = models.CharField(max_length=100, null=True, blank=True, unique=True)
     payment_id = models.CharField(max_length=100, null=True, blank=True, unique=True)
     payment_notification_status = models.CharField(max_length=20, blank=True, default="")
+    payment_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    payment_currency = models.CharField(max_length=3, default="INR")
     @property
     def get_cart_total(self): return sum(item.get_total for item in self.orderitem_set.select_related("product").all())
     @property
