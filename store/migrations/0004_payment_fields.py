@@ -27,6 +27,11 @@ class Migration(migrations.Migration):
             name="payment_id",
             field=models.CharField(max_length=100, null=True, blank=True, unique=True),
         ),
+        migrations.AddField(
+            model_name="order",
+            name="payment_notification_status",
+            field=models.CharField(blank=True, default="", max_length=20),
+        ),
         migrations.AlterField(
             model_name="product",
             name="price",
