@@ -240,6 +240,11 @@ def process_order(request):
     if not name or not email:
         return JsonResponse({"error": "Name and email are required."}, status=400)
 
+    try:
+        validate_email(email)
+    except ValidationError:
+        return JsonResponse({"error": "Enter a valid email address."}, status=400)
+
     customer = get_or_create_customer(request, name, email)
 
     with transaction.atomic():
