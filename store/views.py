@@ -5,6 +5,8 @@ from decimal import Decimal, InvalidOperation
 
 import razorpay
 from django.db import IntegrityError, transaction
+from django.core.validators import validate_email
+from django.core.exceptions import ValidationError
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
@@ -94,6 +96,10 @@ def create_payment_order(request):
     email = (request_data.get("email") or "").strip()
     if not name or not email:
         return JsonResponse({"error": "Name and email are required."}, status=400)
+    try:
+        validate_email(email)
+    except ValidationError:
+        return JsonResponse({"error": "Enter a valid email address."}, status=400)
 
     customer = get_or_create_customer(request, name, email)
 
