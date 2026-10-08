@@ -4,14 +4,14 @@ import uuid
 from decimal import Decimal, InvalidOperation
 
 import razorpay
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from .emails import send_payment_notification
-from .models import Customer, Order, OrderItem, Product, ShippingAddress
+from .models import Customer, Order, OrderItem, Product, RazorpayWebhookEvent, ShippingAddress
 
 
 def get_cart(request):
@@ -164,33 +164,56 @@ def verify_payment(request):
 def razorpay_webhook(request):
     secret = os.environ.get("RAZORPAY_WEBHOOK_SECRET")
     signature = request.headers.get("X-Razorpay-Signature")
-    if not secret or not signature:
+    event_id = request.headers.get("x-razorpay-event-id")
+    if not secret or not signature or not event_id:
         return JsonResponse({"error": "Webhook configuration/signature missing."}, status=400)
+
     try:
-        razorpay_client().utility.verify_webhook_signature(request.body, signature, secret)
+        client = razorpay_client()
+        client.utility.verify_webhook_signature(request.body, signature, secret)
         payload = json.loads(request.body)
     except (razorpay.errors.SignatureVerificationError, json.JSONDecodeError):
         return JsonResponse({"error": "Invalid webhook."}, status=400)
+    except Exception:
+        return JsonResponse({"error": "Webhook processing failed."}, status=500)
 
-    event = payload.get("event")
+    event = payload.get("event", "")
     payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
     rp_order_id = payment.get("order_id")
     order = Order.objects.filter(payment_order_id=rp_order_id).first()
-    if order:
-        if event in {"payment.captured", "order.paid"}:
-            if payment.get("currency") != order.payment_currency or int(payment.get("amount", -1)) != int((order.payment_amount * 100).quantize(Decimal("1"))):
+
+    try:
+        with transaction.atomic():
+            RazorpayWebhookEvent.objects.create(event_id=event_id, event=event)
+            if not order:
+                return JsonResponse({"received": True})
+
+            expected_amount = int((order.payment_amount * 100).quantize(Decimal("1")))
+            webhook_amount = payment.get("amount")
+            webhook_currency = payment.get("currency")
+            if webhook_amount is not None and (int(webhook_amount) != expected_amount or webhook_currency != order.payment_currency):
                 return JsonResponse({"error": "Webhook payment amount mismatch."}, status=400)
-            order.payment_id = payment.get("id") or order.payment_id
-            order.payment_status = Order.PAYMENT_PAID
-            order.complete = True
-            order.save(update_fields=["payment_id", "payment_status", "complete"])
-            send_payment_notification(order, Order.PAYMENT_PAID)
-        elif event == "payment.failed":
-            order.payment_id = payment.get("id") or order.payment_id
-            order.payment_status = Order.PAYMENT_FAILED
-            order.complete = False
-            order.save(update_fields=["payment_id", "payment_status", "complete"])
-            send_payment_notification(order, Order.PAYMENT_FAILED)
+
+            if event in {"payment.captured", "order.paid"}:
+                order.payment_id = payment.get("id") or order.payment_id
+                order.payment_status = Order.PAYMENT_PAID
+                order.complete = True
+                order.save(update_fields=["payment_id", "payment_status", "complete"])
+                notification_status = Order.PAYMENT_PAID
+            elif event == "payment.failed" and order.payment_status != Order.PAYMENT_PAID:
+                order.payment_id = payment.get("id") or order.payment_id
+                order.payment_status = Order.PAYMENT_FAILED
+                order.complete = False
+                order.save(update_fields=["payment_id", "payment_status", "complete"])
+                notification_status = Order.PAYMENT_FAILED
+            else:
+                notification_status = None
+
+        if notification_status and not send_payment_notification(order, notification_status):
+            return JsonResponse({"error": "Payment updated but notification delivery failed."}, status=500)
+    except IntegrityError:
+        return JsonResponse({"received": True})
+
     return JsonResponse({"received": True})
 
 
