@@ -201,11 +201,7 @@ def process_order(request):
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON payload."}, status=400)
 
-    data = get_cart_data(request)
     payment_id, rp_order_id = payload.get("razorpay_payment_id"), payload.get("razorpay_order_id")
-    if not data["items"]:
-        return JsonResponse({"error": "Your cart is empty."}, status=400)
-
     order = Order.objects.filter(payment_order_id=rp_order_id, payment_id=payment_id, payment_status=Order.PAYMENT_PAID).first()
     if not order:
         return JsonResponse({"error": "Payment is not verified."}, status=400)
@@ -219,11 +215,7 @@ def process_order(request):
 
     with transaction.atomic():
         order.customer = customer
-        for item in data["items"]:
-            order_item, _ = OrderItem.objects.get_or_create(order=order, product=item["product"])
-            order_item.quantity = item["quantity"]
-            order_item.save(update_fields=["quantity"])
-        if any(not item["product"].digital for item in data["items"]):
+        if order.shipping:
             required = ("address", "city", "state", "zipcode")
             if any(not str(shipping.get(field, "")).strip() for field in required):
                 return JsonResponse({"error": "Complete shipping information is required."}, status=400)
