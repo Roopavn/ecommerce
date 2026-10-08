@@ -1,7 +1,11 @@
+import logging
+
 from django.conf import settings
 from django.core.mail import send_mail
 
 from .models import Order
+
+logger = logging.getLogger(__name__)
 
 
 def send_payment_notification(order, status):
@@ -33,13 +37,17 @@ def send_payment_notification(order, status):
             "Please try the payment again."
         )
 
-    sent = send_mail(
-        subject,
-        message,
-        settings.DEFAULT_FROM_EMAIL,
-        [order.customer.email],
-        fail_silently=False,
-    )
+    try:
+        sent = send_mail(
+            subject,
+            message,
+            settings.DEFAULT_FROM_EMAIL,
+            [order.customer.email],
+            fail_silently=False,
+        )
+    except Exception:
+        logger.exception("Unable to send payment notification for order %s", order.id)
+        return False
     if sent:
         order.payment_notification_status = status
         order.save(update_fields=["payment_notification_status"])
