@@ -1,7 +1,7 @@
 import json
 import os
 import uuid
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import razorpay
 from django.db import transaction
@@ -28,7 +28,10 @@ def get_cart_data(request):
     products = Product.objects.filter(id__in=product_ids)
     items, cart_items, cart_total = [], 0, Decimal("0.00")
     for product in products:
-        quantity = max(int(cart.get(str(product.id), {}).get("quantity", 0)), 0)
+        try:
+            quantity = max(int(cart.get(str(product.id), {}).get("quantity", 0)), 0)
+        except (TypeError, ValueError):
+            quantity = 0
         if quantity:
             total = product.price * quantity
             items.append({"product": product, "quantity": quantity, "total": total})
@@ -62,6 +65,21 @@ def checkout(request):
 
 
 @require_POST
+def get_or_create_customer(request, name, email):
+    customer = Customer.objects.filter(user=request.user).first() if request.user.is_authenticated else Customer.objects.filter(user__isnull=True, email__iexact=email).first()
+    if not customer:
+        customer = Customer.objects.create(
+            user=request.user if request.user.is_authenticated else None,
+            name=name,
+            email=email,
+        )
+    else:
+        customer.name = name
+        customer.email = email
+        customer.save(update_fields=["name", "email"])
+    return customer
+
+
 def create_payment_order(request):
     data = get_cart_data(request)
     if not data["items"]:
@@ -77,20 +95,10 @@ def create_payment_order(request):
     if not name or not email:
         return JsonResponse({"error": "Name and email are required."}, status=400)
 
-    customer = Customer.objects.filter(user=request.user).first() if request.user.is_authenticated else Customer.objects.filter(user__isnull=True, email=email).first()
-    if not customer:
-        customer = Customer.objects.create(
-            user=request.user if request.user.is_authenticated else None,
-            name=name,
-            email=email,
-        )
-    else:
-        customer.name = name
-        customer.email = email
-        customer.save(update_fields=["name", "email"])
+    customer = get_or_create_customer(request, name, email)
 
-    amount_paise = int(data["cart_total"] * 100)
-    order = Order.objects.create(customer=customer)
+    amount_paise = int((data["cart_total"] * 100).quantize(Decimal("1")))
+    order = Order.objects.create(customer=customer, payment_amount=data["cart_total"], payment_currency="INR")
     for item in data["items"]:
         OrderItem.objects.create(order=order, product=item["product"], quantity=item["quantity"])
 
@@ -129,12 +137,19 @@ def verify_payment(request):
         return JsonResponse({"error": "Order not found."}, status=404)
 
     try:
-        razorpay_client().utility.verify_payment_signature(params)
+        client = razorpay_client()
+        client.utility.verify_payment_signature(params)
+        payment = client.payment.fetch(params["razorpay_payment_id"])
     except razorpay.errors.SignatureVerificationError:
-        order.payment_status = Order.PAYMENT_FAILED
-        order.save(update_fields=["payment_status"])
-        send_payment_notification(order, Order.PAYMENT_FAILED)
-        return JsonResponse({"error": "Payment signature verification failed."}, status=400)
+        return JsonResponse({"error": "Payment verification failed."}, status=400)
+    except Exception:
+        return JsonResponse({"error": "Unable to verify payment with Razorpay."}, status=502)
+
+    expected_amount = int((order.payment_amount * 100).quantize(Decimal("1")))
+    if payment.get("order_id") != order.payment_order_id or int(payment.get("amount", -1)) != expected_amount or payment.get("currency") != order.payment_currency:
+        return JsonResponse({"error": "Payment amount or order mismatch."}, status=400)
+    if payment.get("status") not in {"captured"}:
+        return JsonResponse({"error": "Payment has not been captured."}, status=400)
 
     order.payment_id = params["razorpay_payment_id"]
     order.payment_status = Order.PAYMENT_PAID
@@ -163,6 +178,8 @@ def razorpay_webhook(request):
     order = Order.objects.filter(payment_order_id=rp_order_id).first()
     if order:
         if event in {"payment.captured", "order.paid"}:
+            if payment.get("currency") != order.payment_currency or int(payment.get("amount", -1)) != int((order.payment_amount * 100).quantize(Decimal("1"))):
+                return JsonResponse({"error": "Webhook payment amount mismatch."}, status=400)
             order.payment_id = payment.get("id") or order.payment_id
             order.payment_status = Order.PAYMENT_PAID
             order.complete = True
@@ -198,18 +215,14 @@ def process_order(request):
     if not name or not email:
         return JsonResponse({"error": "Name and email are required."}, status=400)
 
-    customer = Customer.objects.filter(user=request.user).first() if request.user.is_authenticated else Customer.objects.filter(user__isnull=True, email=email).first()
-    if not customer:
-        customer = Customer.objects.create(
-            user=request.user if request.user.is_authenticated else None,
-            name=name,
-            email=email,
-        )
+    customer = get_or_create_customer(request, name, email)
 
     with transaction.atomic():
         order.customer = customer
         for item in data["items"]:
-            OrderItem.objects.get_or_create(order=order, product=item["product"], defaults={"quantity": item["quantity"]})
+            order_item, _ = OrderItem.objects.get_or_create(order=order, product=item["product"])
+            order_item.quantity = item["quantity"]
+            order_item.save(update_fields=["quantity"])
         if any(not item["product"].digital for item in data["items"]):
             required = ("address", "city", "state", "zipcode")
             if any(not str(shipping.get(field, "")).strip() for field in required):
