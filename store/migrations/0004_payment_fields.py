@@ -29,16 +29,6 @@ class Migration(migrations.Migration):
         ),
         migrations.AddField(
             model_name="order",
-            name="payment_amount",
-            field=models.DecimalField(decimal_places=2, default=0, max_digits=12),
-        ),
-        migrations.AddField(
-            model_name="order",
-            name="payment_currency",
-            field=models.CharField(default="INR", max_length=3),
-        ),
-        migrations.AddField(
-            model_name="order",
             name="payment_notification_status",
             field=models.CharField(blank=True, default="", max_length=20),
         ),
