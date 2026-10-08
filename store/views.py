@@ -10,6 +10,7 @@ from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
+from .emails import send_payment_notification
 from .models import Customer, Order, OrderItem, Product, ShippingAddress
 
 
@@ -66,8 +67,30 @@ def create_payment_order(request):
     if not data["items"]:
         return JsonResponse({"error": "Your cart is empty."}, status=400)
 
+    try:
+        request_data = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON payload."}, status=400)
+
+    name = (request_data.get("name") or "").strip()
+    email = (request_data.get("email") or "").strip()
+    if not name or not email:
+        return JsonResponse({"error": "Name and email are required."}, status=400)
+
+    customer = Customer.objects.filter(user=request.user).first() if request.user.is_authenticated else Customer.objects.filter(user__isnull=True, email=email).first()
+    if not customer:
+        customer = Customer.objects.create(
+            user=request.user if request.user.is_authenticated else None,
+            name=name,
+            email=email,
+        )
+    else:
+        customer.name = name
+        customer.email = email
+        customer.save(update_fields=["name", "email"])
+
     amount_paise = int(data["cart_total"] * 100)
-    order = Order.objects.create()
+    order = Order.objects.create(customer=customer)
     rp_order = razorpay_client().order.create({
         "amount": amount_paise,
         "currency": "INR",
@@ -107,12 +130,14 @@ def verify_payment(request):
     except razorpay.errors.SignatureVerificationError:
         order.payment_status = Order.PAYMENT_FAILED
         order.save(update_fields=["payment_status"])
+        send_payment_notification(order, Order.PAYMENT_FAILED)
         return JsonResponse({"error": "Payment signature verification failed."}, status=400)
 
     order.payment_id = params["razorpay_payment_id"]
     order.payment_status = Order.PAYMENT_PAID
     order.complete = True
     order.save(update_fields=["payment_id", "payment_status", "complete"])
+    send_payment_notification(order, Order.PAYMENT_PAID)
     return JsonResponse({"success": True, "order_id": order.id})
 
 
@@ -138,9 +163,14 @@ def razorpay_webhook(request):
             order.payment_id = payment.get("id") or order.payment_id
             order.payment_status = Order.PAYMENT_PAID
             order.complete = True
+            order.save(update_fields=["payment_id", "payment_status", "complete"])
+            send_payment_notification(order, Order.PAYMENT_PAID)
         elif event == "payment.failed":
+            order.payment_id = payment.get("id") or order.payment_id
             order.payment_status = Order.PAYMENT_FAILED
-        order.save(update_fields=["payment_id", "payment_status", "complete"])
+            order.complete = False
+            order.save(update_fields=["payment_id", "payment_status", "complete"])
+            send_payment_notification(order, Order.PAYMENT_FAILED)
     return JsonResponse({"received": True})
 
 
