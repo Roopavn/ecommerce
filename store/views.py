@@ -91,6 +91,9 @@ def create_payment_order(request):
 
     amount_paise = int(data["cart_total"] * 100)
     order = Order.objects.create(customer=customer)
+    for item in data["items"]:
+        OrderItem.objects.create(order=order, product=item["product"], quantity=item["quantity"])
+
     rp_order = razorpay_client().order.create({
         "amount": amount_paise,
         "currency": "INR",
