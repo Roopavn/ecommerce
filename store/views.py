@@ -64,7 +64,6 @@ def checkout(request):
     return render(request, "checkout.html", data)
 
 
-@require_POST
 def get_or_create_customer(request, name, email):
     customer = Customer.objects.filter(user=request.user).first() if request.user.is_authenticated else Customer.objects.filter(user__isnull=True, email__iexact=email).first()
     if not customer:
@@ -80,6 +79,7 @@ def get_or_create_customer(request, name, email):
     return customer
 
 
+@require_POST
 def create_payment_order(request):
     data = get_cart_data(request)
     if not data["items"]:
