@@ -1,8 +1,13 @@
 import json
+import os
+import uuid
+from decimal import Decimal
 
-from django.contrib.auth.models import User
+import razorpay
+from django.db import transaction
 from django.http import JsonResponse
 from django.shortcuts import render
+from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
 from .models import Customer, Order, OrderItem, Product, ShippingAddress
@@ -20,41 +25,123 @@ def get_cart_data(request):
     cart = get_cart(request)
     product_ids = [int(pk) for pk in cart if str(pk).isdigit()]
     products = Product.objects.filter(id__in=product_ids)
-
-    items = []
-    cart_items = 0
-    cart_total = 0
-
+    items, cart_items, cart_total = [], 0, Decimal("0.00")
     for product in products:
         quantity = max(int(cart.get(str(product.id), {}).get("quantity", 0)), 0)
         if quantity:
-            items.append({"product": product, "quantity": quantity, "total": product.price * quantity})
+            total = product.price * quantity
+            items.append({"product": product, "quantity": quantity, "total": total})
             cart_items += quantity
-            cart_total += product.price * quantity
+            cart_total += total
+    return {"items": items, "cart_items": cart_items, "cart_total": cart_total}
 
-    return {
-        "items": items,
-        "cart_items": cart_items,
-        "cart_total": cart_total,
-    }
+
+def razorpay_client():
+    key_id = os.environ.get("RAZORPAY_KEY_ID")
+    key_secret = os.environ.get("RAZORPAY_KEY_SECRET")
+    if not key_id or not key_secret:
+        raise RuntimeError("Razorpay credentials are not configured.")
+    return razorpay.Client(auth=(key_id, key_secret))
 
 
 def store(request):
     products = Product.objects.all().order_by("id")
-    cart = get_cart_data(request)
-    return render(request, "store.html", {"products": products, **cart})
+    return render(request, "store.html", {"products": products, **get_cart_data(request)})
 
 
 def cart(request):
-    cart_data = get_cart_data(request)
-    return render(request, "cart.html", cart_data)
+    return render(request, "cart.html", get_cart_data(request))
 
 
 def checkout(request):
-    cart_data = get_cart_data(request)
-    if not cart_data["items"]:
-        return render(request, "cart.html", cart_data)
-    return render(request, "checkout.html", cart_data)
+    data = get_cart_data(request)
+    if not data["items"]:
+        return render(request, "cart.html", data)
+    return render(request, "checkout.html", data)
+
+
+@require_POST
+def create_payment_order(request):
+    data = get_cart_data(request)
+    if not data["items"]:
+        return JsonResponse({"error": "Your cart is empty."}, status=400)
+
+    amount_paise = int(data["cart_total"] * 100)
+    order = Order.objects.create()
+    rp_order = razorpay_client().order.create({
+        "amount": amount_paise,
+        "currency": "INR",
+        "receipt": f"ecom-{order.id}-{uuid.uuid4().hex[:8]}",
+        "payment_capture": 1,
+    })
+    order.payment_order_id = rp_order["id"]
+    order.transaction_id = rp_order["receipt"]
+    order.save(update_fields=["payment_order_id", "transaction_id"])
+    return JsonResponse({
+        "key": os.environ["RAZORPAY_KEY_ID"],
+        "amount": amount_paise,
+        "currency": "INR",
+        "razorpay_order_id": rp_order["id"],
+        "order_id": order.id,
+    })
+
+
+@require_POST
+def verify_payment(request):
+    try:
+        data = json.loads(request.body or "{}")
+        params = {
+            "razorpay_order_id": data["razorpay_order_id"],
+            "razorpay_payment_id": data["razorpay_payment_id"],
+            "razorpay_signature": data["razorpay_signature"],
+        }
+    except (KeyError, json.JSONDecodeError, TypeError):
+        return JsonResponse({"error": "Invalid payment verification payload."}, status=400)
+
+    order = Order.objects.filter(payment_order_id=params["razorpay_order_id"]).first()
+    if not order:
+        return JsonResponse({"error": "Order not found."}, status=404)
+
+    try:
+        razorpay_client().utility.verify_payment_signature(params)
+    except razorpay.errors.SignatureVerificationError:
+        order.payment_status = Order.PAYMENT_FAILED
+        order.save(update_fields=["payment_status"])
+        return JsonResponse({"error": "Payment signature verification failed."}, status=400)
+
+    order.payment_id = params["razorpay_payment_id"]
+    order.payment_status = Order.PAYMENT_PAID
+    order.complete = True
+    order.save(update_fields=["payment_id", "payment_status", "complete"])
+    return JsonResponse({"success": True, "order_id": order.id})
+
+
+@csrf_exempt
+@require_POST
+def razorpay_webhook(request):
+    secret = os.environ.get("RAZORPAY_WEBHOOK_SECRET")
+    signature = request.headers.get("X-Razorpay-Signature")
+    if not secret or not signature:
+        return JsonResponse({"error": "Webhook configuration/signature missing."}, status=400)
+    try:
+        razorpay_client().utility.verify_webhook_signature(request.body, signature, secret)
+        payload = json.loads(request.body)
+    except (razorpay.errors.SignatureVerificationError, json.JSONDecodeError):
+        return JsonResponse({"error": "Invalid webhook."}, status=400)
+
+    event = payload.get("event")
+    payment = payload.get("payload", {}).get("payment", {}).get("entity", {})
+    rp_order_id = payment.get("order_id")
+    order = Order.objects.filter(payment_order_id=rp_order_id).first()
+    if order:
+        if event in {"payment.captured", "order.paid"}:
+            order.payment_id = payment.get("id") or order.payment_id
+            order.payment_status = Order.PAYMENT_PAID
+            order.complete = True
+        elif event == "payment.failed":
+            order.payment_status = Order.PAYMENT_FAILED
+        order.save(update_fields=["payment_id", "payment_status", "complete"])
+    return JsonResponse({"received": True})
 
 
 @require_POST
@@ -64,58 +151,46 @@ def process_order(request):
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON payload."}, status=400)
 
-    form_data = payload.get("form", {})
-    shipping_data = payload.get("shipping", {})
-    cart_data = get_cart_data(request)
-
-    if not cart_data["items"]:
+    data = get_cart_data(request)
+    payment_id, rp_order_id = payload.get("razorpay_payment_id"), payload.get("razorpay_order_id")
+    if not data["items"]:
         return JsonResponse({"error": "Your cart is empty."}, status=400)
 
-    email = (form_data.get("email") or "").strip()
-    name = (form_data.get("name") or "").strip()
+    order = Order.objects.filter(payment_order_id=rp_order_id, payment_id=payment_id, payment_status=Order.PAYMENT_PAID).first()
+    if not order:
+        return JsonResponse({"error": "Payment is not verified."}, status=400)
 
-    if request.user.is_authenticated:
-        customer, _ = Customer.objects.get_or_create(
-            user=request.user,
-            defaults={"name": request.user.get_full_name(), "email": request.user.email},
-        )
-        customer.name = customer.name or name or request.user.get_full_name()
-        customer.email = customer.email or email or request.user.email
-        customer.save(update_fields=["name", "email"])
-    else:
-        if not name or not email:
-            return JsonResponse({"error": "Name and email are required."}, status=400)
-        customer = Customer.objects.filter(user__isnull=True, email=email).first()
-        if not customer:
-            customer = Customer.objects.create(name=name, email=email)
+    form, shipping = payload.get("form", {}), payload.get("shipping", {})
+    name, email = (form.get("name") or "").strip(), (form.get("email") or "").strip()
+    if not name or not email:
+        return JsonResponse({"error": "Name and email are required."}, status=400)
 
-    order = Order.objects.create(customer=customer)
-
-    for item in cart_data["items"]:
-        OrderItem.objects.create(
-            order=order,
-            product=item["product"],
-            quantity=item["quantity"],
+    customer = Customer.objects.filter(user=request.user).first() if request.user.is_authenticated else Customer.objects.filter(user__isnull=True, email=email).first()
+    if not customer:
+        customer = Customer.objects.create(
+            user=request.user if request.user.is_authenticated else None,
+            name=name,
+            email=email,
         )
 
-    if any(not item["product"].digital for item in cart_data["items"]):
-        required = ("address", "city", "state", "zipcode")
-        if any(not str(shipping_data.get(field, "")).strip() for field in required):
-            order.delete()
-            return JsonResponse({"error": "Complete shipping information is required."}, status=400)
-
-        ShippingAddress.objects.create(
-            customer=customer,
-            order=order,
-            address=shipping_data.get("address", "").strip(),
-            city=shipping_data.get("city", "").strip(),
-            state=shipping_data.get("state", "").strip(),
-            zipcode=shipping_data.get("zipcode", "").strip(),
-            country=shipping_data.get("country", "India").strip() or "India",
-        )
-
-    order.complete = True
-    order.transaction_id = payload.get("transaction_id") or f"ORDER-{order.id}"
-    order.save(update_fields=["complete", "transaction_id"])
-
+    with transaction.atomic():
+        order.customer = customer
+        for item in data["items"]:
+            OrderItem.objects.get_or_create(order=order, product=item["product"], defaults={"quantity": item["quantity"]})
+        if any(not item["product"].digital for item in data["items"]):
+            required = ("address", "city", "state", "zipcode")
+            if any(not str(shipping.get(field, "")).strip() for field in required):
+                return JsonResponse({"error": "Complete shipping information is required."}, status=400)
+            ShippingAddress.objects.get_or_create(
+                order=order,
+                defaults={
+                    "customer": customer,
+                    "address": shipping["address"].strip(),
+                    "city": shipping["city"].strip(),
+                    "state": shipping["state"].strip(),
+                    "zipcode": shipping["zipcode"].strip(),
+                    "country": shipping.get("country", "India").strip() or "India",
+                },
+            )
+        order.save(update_fields=["customer"])
     return JsonResponse({"success": True, "order_id": order.id})
