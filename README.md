@@ -24,3 +24,17 @@ Required environment variables:
 - `DEFAULT_FROM_EMAIL`
 
 Payment notifications are sent from the Django backend after a verified payment success or a verified Razorpay payment failure webhook. SMTP credentials must be stored as deployment secrets/environment variables and never committed to the repository.
+
+
+## Production checklist
+
+Before enabling live payments:
+
+1. Run `python manage.py migrate`.
+2. Set `DJANGO_SECRET_KEY`, `DJANGO_DEBUG=False`, and `DJANGO_ALLOWED_HOSTS`.
+3. Configure `DATABASE_URL` for PostgreSQL (SQLite remains available for local development).
+4. Configure Razorpay live credentials and the verified webhook endpoint.
+5. Configure SMTP credentials for payment notifications.
+6. Run `python manage.py check --deploy` and the test suite.
+7. Verify successful, failed, cancelled, duplicate-webhook, and amount-mismatch payment scenarios in Razorpay Test Mode before switching to live mode.
+8. Never commit Razorpay, SMTP, AWS, or Django secrets to Git.
