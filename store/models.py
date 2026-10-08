@@ -28,6 +28,7 @@ class Order(models.Model):
     payment_status = models.CharField(max_length=20, choices=PAYMENT_CHOICES, default=PAYMENT_PENDING)
     payment_order_id = models.CharField(max_length=100, null=True, blank=True, unique=True)
     payment_id = models.CharField(max_length=100, null=True, blank=True, unique=True)
+    payment_notification_status = models.CharField(max_length=20, blank=True, default="")
     @property
     def get_cart_total(self): return sum(item.get_total for item in self.orderitem_set.select_related("product").all())
     @property
