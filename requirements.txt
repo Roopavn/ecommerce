@@ -11,6 +11,6 @@ packaging==24.1
 pillow==10.3.0
 psycopg2-binary==2.9.9
 razorpay>=1.4.2,<2
-sqlparse==0.5.0
+sqlparse==0.6.0
 typing_extensions==4.12.2
 whitenoise==6.7.0
